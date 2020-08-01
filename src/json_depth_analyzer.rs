@@ -1,4 +1,4 @@
-use std::fmt;
+use thiserror::Error;
 
 #[derive(Debug, Clone)]
 pub struct JsonDepthAnalyzer {
@@ -103,37 +103,17 @@ impl JsonDepthAnalyzer {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Error, Debug, Clone)]
 pub enum ParserError {
+    #[error("expected state Some({expected:?}), got ({got:?})")]
     WrongState {
         got: Option<ParserState>,
         expected: ParserState,
     },
-    WrongHexCharacter {
-        got: u8,
-    },
-    WrongEscapeCharacter {
-        got: u8,
-    },
-}
-
-impl fmt::Display for ParserError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::WrongState {
-                got: Some(got),
-                expected,
-            } => write!(f, "expected state ({:?}), got ({:?})", expected, got),
-            Self::WrongState {
-                got: None,
-                expected,
-            } => write!(f, "expected state ({:?}), got nothing", expected),
-            Self::WrongHexCharacter { got } => write!(f, "expected hex character, got '{}'", got),
-            Self::WrongEscapeCharacter { got } => {
-                write!(f, "expected escape sequence, got \"{}\"", got)
-            }
-        }
-    }
+    #[error("expected hex character, got '{got}'")]
+    WrongHexCharacter { got: u8 },
+    #[error("expected escape sequence, got \"{got}\"")]
+    WrongEscapeCharacter { got: u8 },
 }
 
 #[derive(Debug, Copy, Clone)]

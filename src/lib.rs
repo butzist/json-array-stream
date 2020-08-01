@@ -1,24 +1,16 @@
 use futures::{stream::Stream, task::Context};
 use std::pin::Pin;
 use std::task::Poll;
+use thiserror::Error;
 
 mod json_depth_analyzer;
 
-#[derive(Debug)]
+#[derive(Error, Debug)]
 pub enum JsonStreamError {
-    Io(std::io::Error),
-    Parser(json_depth_analyzer::ParserError),
-}
-
-impl std::error::Error for JsonStreamError {}
-
-impl std::fmt::Display for JsonStreamError {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self {
-            JsonStreamError::Io(err) => err.fmt(f),
-            JsonStreamError::Parser(err) => err.fmt(f),
-        }
-    }
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error("invalid syntax")]
+    Parser(#[from] json_depth_analyzer::ParserError),
 }
 
 pub struct JsonArrayStream<S, B>
