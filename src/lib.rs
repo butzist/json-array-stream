@@ -1,197 +1,74 @@
 use futures::{stream::Stream, task::Context};
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::Poll;
-use thiserror::Error;
 
+mod json_array_stream;
 mod json_depth_analyzer;
 
-#[derive(Error, Debug)]
-pub enum JsonStreamError {
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-    #[error("invalid syntax")]
-    Parser(#[from] json_depth_analyzer::ParserError),
-}
+use json_array_stream::JsonArrayStream;
+pub use json_array_stream::{stream_json_array, JsonStreamError};
 
-pub struct JsonArrayStream<S, B>
+pub struct ParsedStream<T, S, B>
 where
     S: Stream<Item = B>,
     B: IntoIterator<Item = u8> + Sized,
 {
-    analyzer: json_depth_analyzer::JsonDepthAnalyzer,
-    buffer: Vec<u8>,
-    stream: Pin<Box<S>>,
-    chunk: Option<B::IntoIter>,
-    comma: bool,
-    end: bool,
+    stream: JsonArrayStream<S, B>,
+    _t: PhantomData<T>,
 }
 
-impl<S, B> Stream for JsonArrayStream<S, B>
+impl<'de, S, B> JsonArrayStream<S, B>
 where
     S: Stream<Item = B>,
     B: IntoIterator<Item = u8> + Sized,
 {
-    type Item = Result<Vec<u8>, JsonStreamError>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        let this = unsafe { self.get_unchecked_mut() };
-        if this.end {
-            return Poll::Ready(None);
-        }
-
-        loop {
-            if let Some(chunk) = this.chunk.as_mut() {
-                for c in chunk {
-                    let initial_depth = this.analyzer.depth();
-
-                    this.analyzer
-                        .process(c)
-                        .map_err(|err| JsonStreamError::Parser(err))?;
-
-                    if initial_depth == 0 {
-                        continue;
-                    }
-
-                    let emit = if initial_depth == 1 && c == b',' {
-                        this.comma = true;
-                        true
-                    } else if initial_depth == 1 && (c as char).is_whitespace() {
-                        false
-                    } else if this.analyzer.depth() == 0 {
-                        this.end = true;
-                        true
-                    } else {
-                        this.buffer.push(c);
-                        false
-                    };
-
-                    if emit {
-                        if this.buffer.len() == 0 && !this.comma {
-                            return Poll::Ready(None);
-                        }
-
-                        let mut empty = vec![];
-                        std::mem::swap(&mut empty, &mut this.buffer);
-                        return Poll::Ready(Some(Ok(empty)));
-                    }
-                }
-                this.chunk = None;
-            }
-
-            match this.stream.as_mut().poll_next(cx) {
-                Poll::Ready(None) => {
-                    return Poll::Ready(Some(Err(JsonStreamError::Io(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "preliminary EOF when parsing json array",
-                    )))));
-                }
-                Poll::Pending => {
-                    return Poll::Pending;
-                }
-                Poll::Ready(Some(chunk)) => {
-                    this.chunk = Some(chunk.into_iter());
-                }
-            }
-        }
+    pub fn parsed<T>(self) -> ParsedStream<T, S, B>
+    where
+        T: serde::de::Deserialize<'de>,
+    {
+        return ParsedStream {
+            stream: self,
+            _t: PhantomData::<T>,
+        };
     }
 }
 
-fn stream_json_array<S, B>(stream: S) -> JsonArrayStream<S, B>
+impl<T, S, B> Stream for ParsedStream<T, S, B>
 where
     S: Stream<Item = B>,
     B: IntoIterator<Item = u8> + Sized,
+    T: for<'de> serde::de::Deserialize<'de>,
 {
-    JsonArrayStream {
-        stream: Box::pin(stream),
-        analyzer: json_depth_analyzer::JsonDepthAnalyzer::new(),
-        buffer: vec![],
-        chunk: None,
-        comma: false,
-        end: false,
+    type Item = Result<T, JsonStreamError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        let this = unsafe { self.get_unchecked_mut() };
+        match unsafe { Pin::new_unchecked(&mut this.stream) }.poll_next(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(opt) => Poll::Ready(opt.map(|res| {
+                res.and_then(|buffer| {
+                    serde_json::from_slice(&buffer).map_err(|err| JsonStreamError::from(err))
+                })
+            })),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::prelude::*;
-    use std::error::Error;
+    use futures::stream::TryStreamExt;
 
     #[tokio::test]
-    async fn empty_array() {
-        let json = "[]";
+    async fn owned_array() {
+        let json = "[-12,11.1,0]";
         let stream = futures::stream::once(async { json.bytes() });
         let parsed: Result<Vec<_>, _> = stream_json_array(stream)
-            .map_err(|err| Box::new(err) as Box<dyn Error>)
-            .and_then(move |buffer| {
-                future::ready(String::from_utf8(buffer).map_err(|err| Box::new(err).into()))
-            })
+            .parsed::<f64>()
             .try_collect()
             .await;
 
-        assert_eq!(parsed.unwrap(), vec![] as Vec<&str>);
-    }
-
-    #[tokio::test]
-    async fn single_value() {
-        let json = "[12]";
-        let stream = futures::stream::once(async { json.bytes() });
-        let parsed: Result<Vec<_>, _> = stream_json_array(stream)
-            .map_err(|err| Box::new(err) as Box<dyn Error>)
-            .and_then(|buffer| {
-                future::ready(String::from_utf8(buffer).map_err(|err| Box::new(err).into()))
-            })
-            .try_collect()
-            .await;
-
-        assert_eq!(parsed.unwrap(), vec!["12"]);
-    }
-
-    #[tokio::test]
-    async fn multiple_values() {
-        let json = "[\"blubb\", 42,{\"xxx\":false , \"yyy\":\"abc\"} ] ";
-        let stream = futures::stream::once(async { json.bytes() });
-        let parsed: Result<Vec<_>, _> = stream_json_array(stream)
-            .map_err(|err| Box::new(err) as Box<dyn Error>)
-            .and_then(|buffer| {
-                future::ready(String::from_utf8(buffer).map_err(|err| Box::new(err).into()))
-            })
-            .try_collect()
-            .await;
-
-        assert_eq!(
-            parsed.unwrap(),
-            vec!["\"blubb\"", "42", "{\"xxx\":false , \"yyy\":\"abc\"}"]
-        );
-    }
-
-    #[tokio::test]
-    async fn comma_without_values() {
-        let json = "[,]";
-        let stream = futures::stream::once(async { json.bytes() });
-        let parsed: Result<Vec<_>, _> = stream_json_array(stream)
-            .map_err(|err| Box::new(err) as Box<dyn Error>)
-            .and_then(|buffer| {
-                future::ready(String::from_utf8(buffer).map_err(|err| Box::new(err).into()))
-            })
-            .try_collect()
-            .await;
-
-        assert_eq!(parsed.unwrap(), vec!["", ""]);
-    }
-
-    #[tokio::test]
-    async fn dangling_comma() {
-        let json = "[42 , ]";
-        let stream = futures::stream::once(async { json.bytes() });
-        let parsed: Result<Vec<_>, _> = stream_json_array(stream)
-            .map_err(|err| Box::new(err) as Box<dyn Error>)
-            .and_then(|buffer| {
-                future::ready(String::from_utf8(buffer).map_err(|err| Box::new(err).into()))
-            })
-            .try_collect()
-            .await;
-
-        assert_eq!(parsed.unwrap(), vec!["42", ""]);
+        assert_eq!(parsed.unwrap(), vec![-12., 11.1, 0.]);
     }
 }
