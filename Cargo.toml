@@ -1,10 +1,15 @@
 [package]
-name = "async-json-stream"
+name = "json-array-stream"
+description = "Incrementally reads a JSON array through an async stream"
 version = "0.1.0"
 authors = ["Adam Szalkowski <adam@szalkowski.de>"]
+homepage = "https://github.com/butzist/async-json-stream/"
+repository = "https://github.com/butzist/async-json-stream/"
+categories = ["asynchronous", "parsing"]
+keywords = ["json", "async", "stream"]
+license-file = "LICENSE"
+readme = "README.md"
 edition = "2018"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 futures = "0.3.5"
